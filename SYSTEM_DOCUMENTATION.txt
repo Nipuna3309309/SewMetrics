@@ -1,0 +1,936 @@
+================================================================================
+  SEWMETRICS — COMPLETE SYSTEM DOCUMENTATION  (v2.1 — 2-Model Architecture)
+  IoT Sewing Machine Monitoring + ML Analytics Platform
+================================================================================
+  Written for: Developer / Team / Viva Reference
+  Machine in system: SM_01 (Sewing Machine 01)
+  Database records:  ~65,000+ sensor readings in MongoDB Atlas
+  Architecture:      IoT → Node.js → MongoDB → Python (2 ML Models) → React
+  v2.0: 2-model redesign (Isolation Forest + Linear Regression)
+  v2.1: Idle machine detection, vibration threshold consistency, bug fixes
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 1 — WHAT IS SEWMETRICS?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SewMetrics is a real-time IoT factory monitoring system for sewing machines.
+Physical sensors attached to a sewing machine send live data over WiFi using
+the MQTT protocol. That data is received by a backend server, stored in a
+cloud database (MongoDB Atlas), and displayed on a web dashboard.
+
+On top of the live monitoring, a machine learning analytics layer runs on the
+stored data using exactly 2 unified ML models:
+
+  Model 1 — Isolation Forest   "Is the machine behaving abnormally RIGHT NOW?"
+  Model 2 — Linear Regression  "Is the machine slowly getting WORSE over time?"
+
+Together these two models cover the full scope of predictive maintenance:
+short-term fault detection (Model 1) and long-term degradation monitoring
+(Model 2). Both models use all 4 sensors together, not one sensor each.
+
+The system has 3 running services:
+  1. Python Analytics Service  — port 5003  (2 ML models, FastAPI v2.0)
+  2. Node.js Backend           — port 4000  (data ingestion + API + proxy)
+  3. React Frontend            — port 3000  (dashboard UI)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 2 — HOW DATA FLOWS THROUGH THE ENTIRE SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 1 — ARDUINO (HARDWARE)
+  The sewing machine has an ESP32 microcontroller with 4 physical sensors:
+    • Hall-effect sensor  → measures motor RPM (magnetic pulse counting)
+    • IR sensor           → counts needle stitches (interrupt on needle pass)
+    • MPU6050 (IMU)       → measures vibration via 3-axis accelerometer (I2C)
+    • DHT11               → measures temperature and humidity (digital pin)
+
+  The ESP32 reads all sensors every ~5 seconds, formats the data as JSON,
+  and publishes it over MQTT (encrypted, port 8883) to HiveMQ Cloud broker.
+
+  Example MQTT message published to topic  factory/machine/SM_01/rpm :
+  {
+    "machine_id": "SM_01",
+    "sensor": "rpm",
+    "rpm_live": 1423.5,
+    "rpm_1min": 1401.0,
+    "rpm_1min_ready": true,
+    "minute_progress_sec": 42,
+    "current_minute_revs": 980,
+    "time_ms": 1843200,
+    "wifi_connected": true
+  }
+
+  MQTT Topic structure: factory/machine/{machine_id}/{sensor_type}
+  Four topics per machine: .../rpm  .../stitches  .../vibration  .../temperature
+
+STEP 2 — NODE.JS BACKEND (server.js)
+  The backend subscribes to wildcard topic  factory/machine/+/+
+  so it receives ALL messages from ALL machines and ALL sensor types.
+
+  On every received message:
+    a) Parse JSON payload
+    b) Save full document to MongoDB collection "sensor_readings"
+    c) Update in-memory object latestByMachine[machineId] with latest values
+
+  The in-memory object merges all 4 sensor types together so the frontend
+  can get a single merged "snapshot" of all sensors at once.
+
+STEP 3 — MONGODB ATLAS (Cloud Database)
+  Every sensor reading is stored as a document in collection: sensor_readings
+  Fields: machine_id, sensor, topic, received_at, rpm_live, rpm_1min,
+          stitches_total, spm, accel_x, accel_y, accel_z, vibration_stable,
+          temperature_c, humidity, wifi_connected, time_ms, raw_payload
+
+  ~65,000+ documents stored for machine SM_01.
+  Indexed by: machine_id + sensor + received_at
+
+STEP 4 — REST API (Node.js Express)
+  The backend exposes these endpoints to the frontend:
+
+    GET /api/health
+      → Returns system health: mqtt_connected, mongodb_ready
+
+    GET /api/latest/:machineId
+      → Returns the merged in-memory snapshot of ALL sensors for that machine
+      → Used by dashboard for live values (polled every 2.5 seconds)
+
+    GET /api/readings/:machineId?limit=N
+      → Returns last N documents from MongoDB (any sensor type)
+
+    GET /api/history/:machineId/:sensor?limit=N
+      → Returns last N documents filtered by sensor type (rpm/stitches/etc)
+      → Used by charts (polled every 4 seconds)
+
+    GET /api/alerts/:machineId
+      → Runs threshold checks on latest values, returns alert objects
+      → Checks: temperature > 60°C, vibration > 3000, rpm>0 but spm=0
+
+    GET /api/analytics/:type/:machineId
+      → PROXY to Python analytics service on port 5003
+      → Types: anomaly, degradation, system
+
+STEP 5 — PYTHON ANALYTICS SERVICE (FastAPI, port 5003, version 2.0)
+  Fetches historical sensor data from MongoDB for all 4 sensors at once.
+  Runs shared feature engineering, then feeds into one or both ML models.
+  Returns JSON with anomaly flags, degradation trends, health scores,
+  failure projections, and maintenance recommendations.
+  Frontend polls this every 20 seconds.
+
+  DATA FETCH per analytics call:
+    For /anomaly   → last 200 readings per sensor (4 fetches → shared)
+    For /degradation → last 500 readings per sensor (for trend buckets)
+    For /system    → last 300 readings per sensor (both models run internally)
+
+STEP 6 — FEATURE ENGINEERING (Python — analytics/analyzers/features.py)
+  This is the critical bridge between raw sensor docs and the ML models.
+  Both models use the SAME feature engineering function.
+
+  From 4 arrays of raw sensor docs, a sliding window of W=15 readings
+  produces one 9-feature vector:
+
+    [avg_rpm, rpm_std, avg_spm, spm_to_rpm_ratio,
+     vibration_rms, vibration_std, avg_temp, temp_rise_rate, humidity]
+
+  Multiple overlapping windows produce a FEATURE MATRIX X (shape: N × 9).
+  Each row = one snapshot of the machine's state during a 75-second window.
+
+STEP 7 — ML MODEL 1: ISOLATION FOREST (anomaly.py)
+  Input : Feature matrix X — the most recent window is the "current state"
+  Trains on all N windows in X (rolling window baseline = current machine)
+  Scores the latest window to detect if current state is anomalous
+  Returns: anomaly_score (0-1), status, top_contributors (z-scores), etc.
+
+STEP 8 — ML MODEL 2: LINEAR REGRESSION (degradation.py)
+  Input : Same 4 sensor arrays, but viewed as 10 time buckets over history
+  For each bucket, compute 5 health indicators:
+    vibration_level, temperature_level, spm_efficiency, rpm_stability,
+    composite_anomaly_score (Model 1 applied to each historical bucket)
+  Fit OLS regression through each indicator over 10 time points
+  Slope = degradation rate (positive slope on vibration/temp = getting worse)
+  Returns: health_trend_score (0-100), degradation_rate, projected_failure_hours
+
+STEP 9 — SYSTEM HEALTH (system.py)
+  Calls both models, combines into unified Machine Health Score (MHS):
+    MHS = 50% × (100 - anomaly_score × 100)   ← current state health
+        + 50% × health_trend_score              ← long-term trend health
+  Also derives: overall_status, maintenance_priority, issues list
+
+STEP 10 — REACT FRONTEND (port 3000)
+  Single-page app. All API calls proxy through port 4000.
+  Components poll the backend on timers:
+    - Latest sensor data:   every 2,500 ms (live readings)
+    - Historical charts:    every 4,000 ms (history arrays)
+    - ML analytics:         every 20,000 ms (model outputs)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 3 — EVERY FILE IN THE PROJECT (with purpose)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ROOT
+  Arduino.ino             — ESP32 firmware: sensor reading + MQTT publishing
+  SYSTEM_DOCUMENTATION.txt — this file (v2.0, 2-model architecture)
+  REDESIGN_2MODEL.txt     — detailed justification document for the redesign
+  system_documentation.md — shorter overview document (also updated to v2.0)
+
+── BACKEND (Node.js)  ──────────────────────────────────────────────────────────
+  backend/.env            — Environment secrets: MongoDB URI, MQTT credentials,
+                            port numbers, analytics service URL
+  backend/package.json    — Node dependencies: express, mongoose, mqtt, cors, dotenv
+  backend/server.js       — THE ENTIRE BACKEND in one file. Does:
+                            • Connects to MongoDB via Mongoose
+                            • Connects to HiveMQ MQTT broker (TLS/mqtts)
+                            • Subscribes to factory/machine/+/+
+                            • On each message: saves to DB, updates in-memory cache
+                            • Serves 6 REST API endpoints
+                            • Proxies /api/analytics/* to Python service
+
+── ANALYTICS (Python ML Service v2.0)  ─────────────────────────────────────────
+  analytics/.env          — MongoDB URI + ANALYTICS_PORT=5003
+                            (must match ANALYTICS_URL in backend/.env)
+  analytics/requirements.txt — Python dependencies:
+                            fastapi, uvicorn, pymongo, numpy, pandas,
+                            scikit-learn, scipy, python-dotenv
+  analytics/main.py       — FastAPI v2.0 entry point
+                            Defines 3 routes:
+                              GET /analytics/anomaly/{machine_id}   → Model 1
+                              GET /analytics/degradation/{machine_id} → Model 2
+                              GET /analytics/system/{machine_id}    → Both models
+                            Wraps all responses in to_python() serializer
+  analytics/db.py         — MongoDB connection + helper functions:
+                            fetch_sensor(machine_id, sensor, limit)
+                            fetch_all_sensors(machine_id, limit_per_sensor)
+  analytics/utils.py      — to_python() function: recursively converts all
+                            numpy types (numpy.bool_, numpy.float64, etc.)
+                            to native Python types so FastAPI can serialize
+
+  analytics/analyzers/__init__.py  — empty, makes analyzers/ a Python package
+
+  ── NEW (2-model architecture) ──────────────────────────────────────────────
+  analytics/analyzers/features.py    — SHARED feature engineering
+                                       compute_feature_vector() takes W readings
+                                       from each sensor and returns the 9-feature
+                                       vector used by BOTH Model 1 and Model 2.
+                                       Also defines FEATURE_NAMES and
+                                       FEATURE_TO_COMPONENT mapping.
+
+  analytics/analyzers/anomaly.py     — MODEL 1: Isolation Forest
+                                       Takes all 4 sensor arrays.
+                                       Builds feature matrix X from sliding windows.
+                                       Trains IsolationForest on X.
+                                       Scores latest window → anomaly_score, status,
+                                       top_contributors (z-score deviation analysis),
+                                       component_flags, feature_z_scores.
+
+  analytics/analyzers/degradation.py — MODEL 2: Linear Regression Trends
+                                       Takes all 4 sensor arrays.
+                                       Divides into 10 time buckets.
+                                       Computes 5 health indicators per bucket.
+                                       Fits OLS regression to each indicator.
+                                       Returns health_trend_score, degradation_rate,
+                                       per_indicator_trends, projected_failure_hours,
+                                       early_warning, bucket_data for charts.
+
+  analytics/analyzers/system.py      — Combined system health (UPDATED for v2.0)
+                                       Calls analyze_anomaly() + analyze_degradation()
+                                       Combines into MHS (50/50 weighted)
+                                       Returns machine_health_score, overall_status,
+                                       maintenance_priority, rul_hours, issues list.
+
+  ── LEGACY (no longer called by main.py, kept for reference) ─────────────────
+  analytics/analyzers/rpm.py         — OLD: EWMA control chart for RPM only
+  analytics/analyzers/stitches.py    — OLD: Linear regression forecast for stitches
+  analytics/analyzers/vibration.py   — OLD: Isolation Forest for vibration only
+  analytics/analyzers/temperature.py — OLD: Rate-of-change prediction for temp only
+  (These files are NOT called by main.py v2.0 and are not active in the system)
+
+── FRONTEND (React)  ────────────────────────────────────────────────────────────
+  frontend/package.json   — React dependencies: react, recharts, react-router-dom
+                            proxy: "http://localhost:4000" (all /api calls go here)
+  frontend/src/index.js   — React root entry point
+  frontend/src/App.js     — Router setup. Defines all 7 routes:
+                            /overview, /stitch, /rpm, /temperature,
+                            /vibration, /maintenance, /analytics
+                            Exports MACHINE_ID = 'SM_01'
+  frontend/src/styles/global.css — All CSS design tokens and component styles
+  frontend/src/components/Sidebar.jsx — Left navigation sidebar
+
+  HOOKS:
+  frontend/src/hooks/useSensorData.js — Custom React hooks:
+    • useLatest(machineId, intervalMs)     → polls /api/latest/:id every 2.5s
+    • useHistory(machineId, sensor, ...)   → polls /api/history/:id/:sensor every 4s
+    • useAlerts(machineId, intervalMs)     → polls /api/alerts/:id every 4s
+    • useAnalytics(machineId, type, ...)   → polls /api/analytics/:type/:id every 20s
+    • toG(raw)     → converts raw MPU6050 ADC to g-force (divides by 16384)
+    • fmtShort(iso) → formats ISO date to HH:MM
+    • fmtTime(iso)  → formats ISO date to HH:MM:SS
+
+  PAGES:
+  frontend/src/pages/Overview.jsx
+    → Main dashboard. All 4 KPI cards with sparklines, machine status,
+      accelerometer values, live alerts.
+
+  frontend/src/pages/RPMMonitoring.jsx
+    → Detailed RPM page. Status banner, trend chart, per-minute buckets.
+    → ML Panel: shows RPM component's contribution (avg_rpm, rpm_std z-scores)
+      from Model 1, plus RPM stability trend from Model 2.
+
+  frontend/src/pages/StitchMonitoring.jsx
+    → Detailed stitches page. SPM trend, cumulative area chart, efficiency.
+    → ML Panel: shows stitch component contributions (avg_spm, spm_to_rpm_ratio
+      z-scores) from Model 1, plus spm_efficiency trend from Model 2.
+
+  frontend/src/pages/VibrationMonitoring.jsx
+    → Detailed vibration page. Stable EWM vs raw chart, X/Y/Z axis trends.
+    → ML Panel: shows vibration contributions (vibration_rms, vibration_std
+      z-scores) from Model 1, plus vibration_level trend from Model 2.
+
+  frontend/src/pages/TemperatureMonitoring.jsx
+    → Detailed temperature page. Temp + humidity combined chart.
+    → ML Panel: shows temperature contributions (avg_temp, temp_rise_rate,
+      humidity z-scores) from Model 1, plus temperature_level trend from Model 2.
+
+  frontend/src/pages/MaintenanceAlerts.jsx
+    → Threshold-based alerts from /api/alerts/:machineId
+
+  frontend/src/pages/Analytics.jsx  ← MAIN SYSTEM HEALTH PAGE
+    → Full ML dashboard using /api/analytics/system/:id
+    → Circular MHS gauge (SVG arc, 0-100) — hero metric
+    → Anomaly score gauge (from Model 1)
+    → Health trend score and degradation rate (from Model 2)
+    → Early warning flag with projected failure hours
+    → Top contributing features (z-scores, which sensor is responsible)
+    → Per-indicator trend sparklines (vibration, temp, spm_eff, rpm_stability)
+    → Maintenance priority card + issues list ranked by severity
+    → Both model outputs in full detail below
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 4 — THE 9-FEATURE VECTOR (Shared by Both Models)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The key architectural decision: instead of each model watching one sensor,
+BOTH models receive a 9-feature vector computed from ALL 4 sensors together.
+This enables cross-sensor correlation — the most powerful diagnostic signals.
+
+  ┌────┬──────────────────────┬──────────────────────────────────────────────┐
+  │ #  │ Feature              │ What it captures                             │
+  ├────┼──────────────────────┼──────────────────────────────────────────────┤
+  │ F1 │ avg_rpm              │ Mean motor speed over window W               │
+  │ F2 │ rpm_std              │ RPM stability — high std = erratic motor     │
+  │ F3 │ avg_spm              │ Mean stitches per minute — production rate   │
+  │ F4 │ spm_to_rpm_ratio     │ avg_spm / (avg_rpm + ε) — THE KEY FEATURE   │
+  │    │                      │ RPM=1400, SPM=0 → ratio=0 → thread jam      │
+  │    │                      │ catches faults no single sensor can detect  │
+  │ F5 │ vibration_rms        │ sqrt(mean(vibration_stable²)) — RMS energy  │
+  │ F6 │ vibration_std        │ Vibration consistency — erratic = fault     │
+  │ F7 │ avg_temp             │ Mean temperature over window                │
+  │ F8 │ temp_rise_rate       │ °C/min from polyfit slope — rising = danger │
+  │ F9 │ humidity             │ Latest humidity % — affects motor insulation│
+  └────┴──────────────────────┴──────────────────────────────────────────────┘
+
+  File: analytics/analyzers/features.py
+  Window size W = 15 readings ≈ 75 seconds of machine data per feature vector
+  Called by BOTH anomaly.py (Model 1) and degradation.py (Model 2)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 5 — ML MODELS: DEEP EXPLANATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+ MODEL 1: ISOLATION FOREST — Real-time Multi-sensor Anomaly Detection
+ File: analytics/analyzers/anomaly.py
+ Endpoint: GET /analytics/anomaly/{machine_id}
+────────────────────────────────────────────────────────────────────────────────
+
+PURPOSE:
+  "Is the machine behaving abnormally RIGHT NOW?"
+  Detects when the current machine state (across all 4 sensors together)
+  is statistically unusual compared to its recent normal behavior.
+
+ALGORITHM — HOW ISOLATION FOREST WORKS:
+  Isolation Forest (Liu et al., 2008). Unsupervised anomaly detection.
+  Core insight: anomalies are rare and different — they are EASIER TO ISOLATE.
+
+  1. Fetch last 200 readings from each of 4 sensor types.
+  2. Apply shared feature engineering (features.py):
+       For each sliding window of W=15 readings (stride=1):
+         Compute the 9-feature vector.
+         Append to feature matrix X.
+       X shape = (N_windows, 9) where N_windows ≈ 40-185 windows
+  3. Train: IsolationForest(n_estimators=100, contamination=0.05).fit(X)
+       Build 100 random decision trees on the feature matrix.
+       At each tree node: pick a random feature, pick a random split value.
+       Keep splitting until each sample is isolated in its own leaf node.
+       Count path length to isolate each sample across all 100 trees.
+       Short path = anomaly (easy to isolate = different from others).
+       Long path  = normal  (hard to isolate = similar to most data).
+  4. Score the LATEST window (X[-1]):
+       raw_score  = model.score_samples(X[-1:])  ← lower = more anomalous
+       anomaly_flag = model.predict(X[-1:]) == -1
+       Normalize to 0-1: anomaly_score = 1 - (score - min) / (max - min + ε)
+  5. Feature importance (explainability — deviation analysis):
+       mean_i = mean(X[:, i]) across all N windows
+       std_i  = std(X[:, i]) across all N windows
+       z_i    = (X[-1, i] - mean_i) / (std_i + ε)    for each feature i
+       |z_i| > 2 = that feature is contributing to the anomaly
+       top_contributors = features sorted by |z_i| descending, top 3 shown
+  6. Map features to sensor components:
+       avg_rpm, rpm_std              → "rpm" component
+       avg_spm, spm_to_rpm_ratio     → "stitches" component
+       vibration_rms, vibration_std  → "vibration" component
+       avg_temp, temp_rise_rate, humidity → "temperature" component
+       component_flags = which components have features in top_contributors
+
+COLD START (< 10 running windows):
+  Falls back to z-score across all 9 features (using running windows only).
+  max_abs_z = max |z_i| across all 9 features; norm_score = min(1.0, max_abs_z/4.0)
+  Anomaly if max_abs_z > 2.5.
+
+ANOMALY THRESHOLDS:
+  Score 0.00 – 0.49 → "normal"
+  Score 0.50 – 0.69 → "watch"
+  Score 0.70 – 0.84 → "warning"
+  Score 0.85 – 1.00 → "critical"
+
+IDLE MACHINE DETECTION (sewing machine stop is NORMAL, not anomalous):
+  A sewing machine regularly stops between operations (fabric repositioning,
+  thread changes, operator breaks). Idle stops must NOT trigger anomaly alerts.
+
+  IDLE_RPM_THRESH = 50.0 (avg_rpm feature, index 0 in feature vector)
+
+  Logic flow:
+    1. If current_rpm (X[-1, 0]) < 50 → immediately return idle_result
+       idle_result: anomaly_flag=False, anomaly_score=0.0, status="idle",
+                    top_contributors=[], model="idle_bypass"
+    2. Filter feature matrix to running windows only:
+       X_running = X[X[:, 0] >= 50.0]
+    3. Train Isolation Forest ONLY on X_running
+       → idle stops do not distort the baseline for running behavior
+
+  Why this matters: Without idle detection, idle windows (avg_rpm≈0, avg_spm=0)
+  look like extreme outliers against the running baseline, causing the model to
+  score them as CRITICAL. A 50 RPM threshold cleanly separates idle from running.
+
+TRAINING STRATEGY — ROLLING WINDOW RETRAINING:
+  We retrain on the last 200 readings every API call. This is adaptive baseline.
+  Why not train once and persist?
+    - A machine after maintenance has a new normal — should not be anomalous.
+    - Rolling window automatically adapts to the current machine state.
+  Why not train on ALL historical data?
+    - A machine from 3 months ago may have been poorly tuned.
+    - Anomaly = unusual for THIS machine NOW, not its entire history.
+
+PARAMETERS:
+  n_estimators  = 100   (100 trees for robust, stable scoring)
+  contamination = 0.05  (assume ≤5% of readings are genuinely anomalous)
+  random_state  = 42    (reproducible results for reports)
+  Window W      = 15    (15 readings × 5s = 75s per feature snapshot)
+
+OUTPUTS:
+  anomaly_flag      (bool) — True if current state is anomalous
+  anomaly_score     (float 0-1) — higher = more anomalous
+  status            ("normal" | "watch" | "warning" | "critical" | "idle")
+  top_contributors  (list of {feature, z_score, component})
+  component_flags   ({rpm, stitches, vibration, temperature} → bool)
+  feature_vector    (the 9 raw feature values for the latest window)
+  feature_z_scores  ({feature_name: z_score} for all 9 features)
+  model             ("isolation_forest" | "zscore_fallback")
+  samples_used      (int — number of windows in training matrix)
+
+
+────────────────────────────────────────────────────────────────────────────────
+ MODEL 2: LINEAR REGRESSION — Long-term Degradation Trend Detection
+ File: analytics/analyzers/degradation.py
+ Endpoint: GET /analytics/degradation/{machine_id}
+────────────────────────────────────────────────────────────────────────────────
+
+PURPOSE:
+  "Is the machine slowly getting WORSE over time?"
+  Detects gradual degradation that builds up over hours or days — wear that
+  never triggers an anomaly at any single reading but IS shortening the
+  machine's life. Invisible to Model 1. Only visible with trend analysis.
+
+WHY LINEAR REGRESSION FOR DEGRADATION?
+  Mechanical wear follows approximately linear progression (Archard's wear law).
+  OLS regression gives a slope interpretable directly: "vibration increasing
+  by 8.4 units per hour". The slope projects forward to failure: "3000 units
+  threshold reached in 7.3 hours." Fully explainable — no black box.
+  No training data needed. No labeled failure examples required.
+  R² tells you how clean the trend is: high R² = real degradation, not noise.
+
+THE 5 TREND INDICATORS (Model 2's input features, one per bucket):
+  ┌────┬──────────────────────────┬────────────────────────────────────────────┐
+  │ T1 │ vibration_level          │ mean(vibration_stable) per bucket          │
+  │    │                          │ Rising over time → bearing wear, imbalance │
+  ├────┼──────────────────────────┼────────────────────────────────────────────┤
+  │ T2 │ temperature_level        │ mean(temperature_c) per bucket             │
+  │    │                          │ Slowly rising baseline → cooling degrading │
+  ├────┼──────────────────────────┼────────────────────────────────────────────┤
+  │ T3 │ spm_efficiency           │ mean(spm) / (mean(rpm) + ε) per bucket     │
+  │    │                          │ Falling ratio → mechanical wear in needle, │
+  │    │                          │ increasing thread drag over sessions        │
+  ├────┼──────────────────────────┼────────────────────────────────────────────┤
+  │ T4 │ rpm_stability            │ 1 / (std(rpm) + 1) per bucket              │
+  │    │                          │ INVERSE of RPM variability.                │
+  │    │                          │ Declining stability → power degrading       │
+  ├────┼──────────────────────────┼────────────────────────────────────────────┤
+  │ T5 │ composite_anomaly_score  │ Model 1's IF score applied to each bucket  │
+  │    │                          │ Rising scores over time = machine gets      │
+  │    │                          │ progressively harder to classify as normal  │
+  └────┴──────────────────────────┴────────────────────────────────────────────┘
+
+  NOTE on T5 (composite_anomaly_score):
+  This is the most powerful trend indicator. Model 1's feature engineering
+  is applied to each historical bucket, then scored with the Isolation Forest.
+  A rising sequence of anomaly scores over hours = clearest degradation signal
+  even if no individual reading ever crossed a threshold.
+
+HOW IT WORKS STEP BY STEP:
+  1. Fetch last 500 readings per sensor from MongoDB.
+  2. Sort all by received_at. Divide into N_BUCKETS = 10 equal time segments.
+  3. For each bucket:
+       Compute: vib_level, temp_level, spm_eff, rpm_stability
+       Mark bucket as idle if avg_rpm < 50.0 (is_idle = True)
+       Apply feature engineering to bucket data → score with Isolation Forest
+       → anomaly_score for this historical period
+       Append [vib_level, temp_level, spm_eff, rpm_stability, anomaly_score]
+       Result: trend_matrix shape (10, 5)
+
+  IDLE BUCKET EXCLUSION:
+       For spm_efficiency and rpm_stability regression:
+         Only use non-idle buckets (avg_rpm >= 50). Idle periods have
+         spm=0 and rpm=0 which would pull the regression slope negative,
+         making a healthy machine appear to be "degrading" in efficiency.
+         Minimum 3 non-idle buckets required; otherwise slope=0.0 (stable).
+       vibration_level, temperature_level, anomaly_score: use all buckets
+         (these are valid to measure even during idle periods).
+
+  4. For each of the 5 columns in trend_matrix:
+       slope, intercept = polyfit(range(10), trend_matrix[:, j], 1)
+       r_squared = pearsonr(range(10), trend_matrix[:, j])[0]²
+  5. Normalize each slope to a degradation contribution:
+       vibration:    contribution = slope / VIBRATION_DANGER (3000 units)
+       temperature:  contribution = slope / TEMP_DANGER (60°C)
+       spm_eff:      contribution = -slope  (negative slope = degrading)
+       rpm_stability: contribution = -slope  (negative slope = degrading)
+       anomaly_score: contribution = slope   (already 0-1 scale)
+  6. degradation_rate = mean(all 5 contributions) × 100  (%/hour scale)
+  7. health_trend_score = max(0, min(100, 100 - degradation_rate × 10))
+  8. projected_failure_hours = minimum across all indicators:
+       For each indicator: readings_to_danger = (danger - current) / slope
+       Convert to hours using bucket duration.
+  9. early_warning = True if ANY of:
+       degradation_rate > 2.0 (rapid worsening)
+       health_trend_score < 70 AND anomaly_score_trend slope > 0
+       vibration trend projects failure within 7 days
+       temperature trend projects crossing 60°C within 24 hours
+       R² of any critical indicator > 0.8 (clean trend = real degradation)
+
+HEALTH TREND SCORE INTERPRETATION:
+  100     → No degradation detected, all trends stable or improving
+  80-99   → Minor degradation — monitor
+  60-79   → Moderate degradation — plan maintenance soon
+  40-59   → Significant degradation — schedule maintenance this week
+  0-39    → Rapid degradation — urgent maintenance required
+
+OUTPUTS:
+  health_trend_score      (0-100, 100 = no degradation)
+  degradation_rate        (%/hr, positive = worsening)
+  trend_status            ("stable" | "mild" | "moderate" | "significant" | "rapid")
+  early_warning           (bool)
+  projected_failure_hours (float or None)
+  per_indicator_trends    ({indicator: {slope, r_squared, direction, projected_hours}})
+  bucket_data             (list of 10 bucket summaries — used for sparkline charts)
+  buckets_analysed        (int)
+  samples_used            (int)
+
+
+────────────────────────────────────────────────────────────────────────────────
+ COMBINED: SYSTEM HEALTH (system.py)
+ Endpoint: GET /analytics/system/{machine_id}
+────────────────────────────────────────────────────────────────────────────────
+
+PURPOSE:
+  Single endpoint that runs BOTH models and combines their outputs into
+  one unified machine health assessment. This is what the Analytics.jsx
+  dashboard page calls.
+
+MACHINE HEALTH SCORE (MHS) FORMULA:
+  MHS = 50% × (100 - anomaly_score × 100)   ← current state (Model 1)
+      + 50% × health_trend_score              ← long-term health (Model 2)
+  Range: 0-100
+
+  MHS interpretation:
+    80-100 → HEALTHY  (all systems operating normally)
+    65-79  → WATCH    (minor issues, monitor closely)
+    45-64  → WARNING  (significant issues, plan maintenance)
+    0-44   → CRITICAL (stop machine, immediate inspection)
+
+IDLE STATUS PROPAGATION:
+  If Model 1 returns status="idle" (machine currently stopped):
+    → overall_status = "idle" regardless of MHS value
+    → Machine is never classified as "critical" while stopped
+  This prevents false alarms when operators pause the sewing machine between
+  operations, which is a completely normal part of the sewing workflow.
+
+MAINTENANCE PRIORITY:
+  MHS < 30 OR rul_hours < 1  → URGENT
+  MHS < 50 OR rul_hours < 4  → HIGH
+  MHS < 65 OR 2+ issues      → MEDIUM
+  MHS < 80                   → LOW
+  MHS >= 80                  → NONE
+
+ISSUES LIST:
+  Aggregates anomaly contributors from Model 1 (which features deviated)
+  and degradation indicators from Model 2 (which indicators are trending bad).
+  Ranked by severity (critical first, warning, watch, info).
+
+OUTPUTS:
+  machine_health_score  (0-100)
+  overall_status        ("healthy" | "watch" | "warning" | "critical" | "offline" | "idle")
+  maintenance_priority  ("none" | "low" | "medium" | "high" | "urgent")
+  rul_hours             (projected_failure_hours from Model 2, or None)
+  issues                (list of {component, severity, message} ranked by severity)
+  anomaly               (full Model 1 output)
+  degradation           (full Model 2 output)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 6 — ALL API ENDPOINTS REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NODE.JS BACKEND (port 4000):
+  GET  /api/health                              → {status, mqtt_connected, mongodb_ready}
+  GET  /api/latest/:machineId                   → merged latest snapshot of all sensors
+  GET  /api/readings/:machineId?limit=N         → last N documents (any sensor)
+  GET  /api/history/:machineId/:sensor?limit=N  → last N of specific sensor type
+  GET  /api/alerts/:machineId                   → threshold-based alerts
+  GET  /api/analytics/:type/:machineId          → proxy to Python service
+                                                   types: anomaly, degradation, system
+
+PYTHON ANALYTICS SERVICE (port 5003, v2.0):
+  GET  /health
+    → {status: "ok", service: "sewmetrics-analytics", version: "2.0.0"}
+
+  GET  /analytics/anomaly/{machine_id}?limit=200
+    → Model 1 (Isolation Forest)
+    → Returns: anomaly_flag, anomaly_score, status, top_contributors,
+               component_flags, feature_vector, feature_z_scores,
+               model, samples_used
+
+  GET  /analytics/degradation/{machine_id}?limit=500
+    → Model 2 (Linear Regression Degradation)
+    → Returns: health_trend_score, degradation_rate, trend_status,
+               early_warning, projected_failure_hours, per_indicator_trends,
+               bucket_data, buckets_analysed, samples_used
+
+  GET  /analytics/system/{machine_id}?limit=300
+    → Runs BOTH models internally, combines into MHS
+    → Returns: machine_health_score, overall_status, maintenance_priority,
+               rul_hours, issues, anomaly (full M1), degradation (full M2)
+
+LEGACY ENDPOINTS — REMOVED:
+  /analytics/rpm/:machineId       → no longer exists in v2.0
+  /analytics/stitches/:machineId  → no longer exists in v2.0
+  /analytics/vibration/:machineId → no longer exists in v2.0
+  /analytics/temperature/:machineId → no longer exists in v2.0
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 7 — HOW TO START THE SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. Start Python Analytics Service:
+       cd D:/Sewmetrics/analytics
+       python main.py
+       → Starts on http://localhost:5003 (version 2.0, 2-model architecture)
+       → analytics/.env must have ANALYTICS_PORT=5003 (matches backend ANALYTICS_URL)
+
+  2. Start Node Backend:
+       cd D:/Sewmetrics/backend
+       node server.js
+       → Starts on http://localhost:4000
+       → Connects to HiveMQ MQTT and MongoDB Atlas automatically
+
+  3. Start React Frontend:
+       cd D:/Sewmetrics/frontend
+       npm start
+       → Starts on http://localhost:3000
+       → Opens browser automatically
+
+  Visit http://localhost:3000 to use the dashboard.
+  Visit http://localhost:5003/docs for the FastAPI interactive API docs.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 8 — TECHNOLOGY STACK SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Hardware:
+    ESP32 microcontroller, Hall-effect sensor, IR sensor, MPU6050, DHT11
+
+  Protocol:
+    MQTT over TLS (mqtts://) → HiveMQ Cloud broker
+
+  Backend:
+    Node.js 18+, Express 5, Mongoose 9, mqtt.js 5, dotenv
+
+  Database:
+    MongoDB Atlas (cloud) — collection: sensor_readings
+
+  Analytics (v2.0):
+    Python 3.13, FastAPI 2.0, Uvicorn, PyMongo
+    NumPy (array math), Pandas (data manipulation), SciPy (statistics)
+    Scikit-learn (IsolationForest), Python-dotenv
+
+  Frontend:
+    React 18, React Router 6, Recharts (charts), Create React App
+
+  ML Algorithms (v2.0 — 2 unified models):
+    1. Isolation Forest (Liu et al., 2008) — Model 1: real-time anomaly detection
+       Input: 9 cross-sensor engineered features from all 4 sensors
+       Output: anomaly score, status, top contributing features (z-scores)
+
+    2. OLS Linear Regression (numpy.polyfit) — Model 2: degradation trend
+       Input: 5 health indicators over 10 time buckets
+       Output: degradation rate, health trend score, projected failure hours
+
+    3. Shared Feature Engineering (features.py) — used by both models
+       Computes 9-feature vectors from sliding windows of multi-sensor data
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 9 — KEY DESIGN DECISIONS EXPLAINED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why 2 models instead of the original 4?
+A: The original 4 models each watched one sensor in isolation. They could not
+   detect cross-sensor anomalies (e.g., RPM=1400 but SPM=0 → thread jam —
+   missed by RPM model, missed by temperature model, only caught by stitches
+   model, but no single model saw the full picture). The 2-model design sees
+   ALL 4 sensors together via the 9-feature vector, enabling cross-sensor
+   correlation. It also adds long-term degradation detection (Model 2) which
+   the 4-model system completely lacked.
+
+Q: Why is ML in Python and not in Node.js?
+A: Scikit-learn, NumPy, and SciPy are mature Python libraries with no
+   equivalent in Node.js. Python has dominated scientific computing for
+   20 years. Node.js is better at real-time I/O (MQTT, API).
+   Each language is used where it is strongest.
+
+Q: Why does the Node backend proxy to Python instead of the frontend calling
+   Python directly?
+A: Single origin for the frontend. The React app only needs to talk to
+   localhost:4000. If Python moves to a different server, only the proxy
+   URL changes — zero frontend changes needed.
+
+Q: Why poll every 20 seconds for ML and 2.5 seconds for live data?
+A: Feature engineering + IsolationForest training on 200×9 matrix takes
+   ~50-200ms. Doing it every 2.5 seconds would unnecessarily load CPU and
+   MongoDB. Live sensor values are in-memory reads — 2.5s is fine.
+
+Q: Why retrain the Isolation Forest on every API call?
+A: The model trains on the LAST N readings, so it adapts to the current
+   machine state automatically. After maintenance the machine has a new
+   normal — a model trained yesterday would incorrectly flag normal readings.
+   Rolling window retraining is the correct approach for streaming sensor data.
+
+Q: Why contamination=0.05 in the Isolation Forest?
+A: Tells the model to assume ≤5% of readings may be anomalous.
+   Too low (0.01) → misses real anomalies.
+   Too high (0.20) → too many false alarms.
+   5% is the standard industry default for mechanical sensor data.
+
+Q: Why Linear Regression for degradation and not a more complex model?
+A: Mechanical wear IS approximately linear over time (Archard's law).
+   The slope maps directly to a rate ("8.4 vibration units per hour").
+   Projecting to failure is simple division. R² gives confidence level.
+   No training data required. Fully explainable in a viva or report.
+   A more complex model would give the same answer with 100× more complexity
+   and 0 additional interpretability.
+
+Q: Why use composite_anomaly_score (T5) as a trend indicator?
+A: Running Model 1 on each historical time bucket and plotting the resulting
+   anomaly scores over time reveals if the machine is progressively harder
+   to classify as normal. A rising sequence of anomaly scores over hours
+   is the clearest possible signal of gradual degradation — even if no
+   individual reading ever crossed the anomaly threshold.
+
+Q: What happened to the old EWMA, stitches forecast, etc.?
+A: Those algorithms are still in the codebase (rpm.py, stitches.py, etc.)
+   but are no longer called by main.py v2.0. Their analytical value is
+   preserved — EWMA signals are captured by avg_rpm/rpm_std in the feature
+   vector; stitch forecasting insights appear in spm_to_rpm_ratio and
+   spm_efficiency trend; vibration Isolation Forest is now applied to all
+   9 features not just 4 vibration features; temperature rate-of-change is
+   captured by temp_rise_rate in the feature vector.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 10 — OLD vs NEW: COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌────────────────────────────┬────────────────────────┬──────────────────────────────┐
+  │ Aspect                     │ Old v1.0 (4 models)    │ New v2.0 (2 models)          │
+  ├────────────────────────────┼────────────────────────┼──────────────────────────────┤
+  │ Number of ML models        │ 4                      │ 2                            │
+  │ Sensors per model          │ 1 each                 │ All 4 combined               │
+  │ Number of API endpoints    │ 4 analytics + 1 system │ 2 analytics + 1 system       │
+  │ DB queries per request     │ 4 separate             │ 1 shared fetch_all_sensors() │
+  │ Cross-sensor features      │ None                   │ spm_to_rpm_ratio, combos     │
+  │ Real-time anomaly          │ Per-sensor only        │ All sensors combined          │
+  │ Trend/degradation detect.  │ RPM only (partial)     │ 5 indicators, all sensors    │
+  │ Feature importance output  │ None                   │ Z-score deviation analysis   │
+  │ Failure projection         │ Temperature only       │ All 5 indicators combined    │
+  │ Industrial standard        │ Partial                │ ISO 13374 aligned            │
+  │ Code files (analyzers)     │ 5 files (~486 lines)   │ 3 files (~280 lines)         │
+  │ Labeled training data      │ Not required           │ Not required                 │
+  │ Explainability             │ Medium                 │ High (z-scores + plain text) │
+  └────────────────────────────┴────────────────────────┴──────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 11 — ONE-LINE SUMMARIES FOR VIVA / PRESENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  System:
+   "SewMetrics uses IoT sensors and 2 unified ML models — an Isolation Forest
+    for real-time multi-sensor anomaly detection and a Linear Regression for
+    long-term degradation trend analysis — to predict sewing machine failures
+    before they occur, without requiring labeled training data."
+
+  Model 1:
+   "Isolation Forest takes 9 engineered features from all 4 sensors together
+    and flags when the current machine state is statistically unusual relative
+    to its own recent baseline."
+
+  Model 2:
+   "Linear Regression fits trend lines to 5 health indicators over time and
+    detects when the machine is slowly getting worse, even before any individual
+    reading crosses an alert threshold."
+
+  Why 2 models:
+   "One model watches for problems RIGHT NOW using all 4 sensors simultaneously.
+    The other watches for problems BUILDING UP OVER TIME across the same sensors.
+    Together they cover both short-term faults and long-term wear."
+
+  spm_to_rpm_ratio:
+   "If the motor is spinning at 1400 RPM but stitches per minute is zero,
+    the ratio collapses to near zero — an unambiguous thread jam or needle
+    failure that no single-sensor model could detect."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 12 — VIBRATION THRESHOLDS (Consistent Across All Components)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The MPU6050 accelerometer stores vibration_stable as raw ADC units.
+The ±2g scale gives: 1 g-force = 16384 ADC units.
+
+THRESHOLD STANDARD (applied consistently across ALL frontend pages):
+  Normal   : vibration_g < 0.10 g    (raw < 1638)
+  Warning  : vibration_g 0.10–0.20 g (raw 1638–3277)
+  Critical : vibration_g ≥ 0.20 g    (raw ≥ 3277)
+
+CONVERSION:  vibration_g = vibration_stable / 16384
+
+These thresholds apply in:
+  • server.js              — real-time MQTT alert generation
+  • VibrationMonitoring.jsx — KPI card, chart reference lines, status label
+  • Overview.jsx           — vibration KPI card, priority alert trigger
+  • MaintenanceAlerts.jsx  — KPI card, vibration chart reference lines
+  • backend alerts API     — /api/alerts/:machineId threshold checks
+
+IMPORTANT: server.js alert logic converts to g-force BEFORE comparing:
+  const vibG = latest.vibration_stable / 16384;
+  if (vibG >= 0.2) → critical alert
+  if (vibG >= 0.1) → warning alert
+
+Chart display: all vibration charts show values in g-force (after /16384),
+capped at G_MAX_CHART = 0.3 g on the VibrationMonitoring page.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 13 — BUG FIXES APPLIED (v2.1 patch)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The following bugs were identified and fixed after the initial v2.0 release:
+
+BUG 1 — server.js: Vibration alert compared raw ADC units against g thresholds
+  File   : backend/server.js  (alert generation block)
+  Problem: `if (latest.vibration_stable >= 0.2)` — comparing raw units (0–32767)
+           against g-force thresholds (0.1/0.2). Any real vibration reading
+           (e.g., 1500 ADC units) is always >> 0.2, so alerts ALWAYS fired.
+  Fix    : Added conversion before comparison:
+             const vibG = latest.vibration_stable / 16384;
+             if (vibG >= 0.2) → critical; else if (vibG >= 0.1) → warning
+
+BUG 2 — Analytics.jsx: Wrong port in error message
+  File   : frontend/src/pages/Analytics.jsx
+  Problem: Error fallback text said "port 5002" but backend proxies to 5003.
+  Fix    : Updated error message to reference port 5003.
+
+BUG 3 — Analytics.jsx: Hardcoded machine ID "SM_01" in error text
+  File   : frontend/src/pages/Analytics.jsx
+  Problem: Error message hardcoded "SM_01" instead of using MACHINE_ID constant.
+  Fix    : Changed to `{MACHINE_ID}` so it works for any machine.
+
+BUG 4 — VibrationMonitoring.jsx: safeAxisG returned 0 for invalid readings
+  File   : frontend/src/pages/VibrationMonitoring.jsx
+  Problem: `safeAxisG()` returned 0 for NaN/Infinity values, causing the
+           X/Y/Z trend chart to plot spurious zero points instead of gaps.
+  Fix    : Returns `null` so Recharts skips those data points cleanly.
+
+BUG 5 — StitchMonitoring.jsx: avgSpm included idle readings (spm=0)
+  File   : frontend/src/pages/StitchMonitoring.jsx
+  Problem: Average SPM KPI was computed over all history including idle periods
+           where spm=0, artificially lowering the displayed average.
+  Fix    : Filter to active readings only before averaging:
+             const active = chartData.filter(r => (r.spm || 0) > 0);
+
+BUG 6 — TemperatureMonitoring.jsx: Incorrect heat index formula
+  File   : frontend/src/pages/TemperatureMonitoring.jsx
+  Problem: `heatIndexApprox` used an incorrect simple linear approximation
+           that gave wrong apparent temperature values.
+  Fix    : Implemented Steadman apparent temperature formula:
+             e = (hum/100) × 6.105 × exp(17.27T / (237.7+T))
+             AT = T + 0.33×e − 4.0
+
+BUG 7 — Overview.jsx: spmDelta used wrong array index (oldest, not newest)
+  File   : frontend/src/pages/Overview.jsx
+  Problem: `const cur = stH[0]?.spm || 0` — useHistory returns oldest-first,
+           so stH[0] is the OLDEST reading. The "current" SPM delta was wrong.
+  Fix    : `const cur = stH[stH.length - 1]?.spm || 0` (most recent reading)
+
+BUG 8 — Overview.jsx: corrData double-reversed (wrong chart direction)
+  File   : frontend/src/pages/Overview.jsx
+  Problem: `corrH.reverse()` was called on the correlation chart data, but
+           useHistory already returns data in oldest-first (chronological) order.
+           Double-reversing it showed the chart newest-to-oldest.
+  Fix    : Removed the `.reverse()` call — corrH already chronological.
+
+BUG 9 — anomaly.py: Docstring missing "idle" in status list
+  File   : analytics/analyzers/anomaly.py
+  Problem: Module docstring listed status as "normal|watch|warning|critical"
+           but idle detection was added without updating the docstring.
+  Fix    : Added "idle" to the status list in the docstring.
+
+VIBRATION THRESHOLD INCONSISTENCY (also fixed):
+  File   : frontend/src/pages/Overview.jsx, VibrationMonitoring.jsx,
+           MaintenanceAlerts.jsx
+  Problem: Overview.jsx used Warn=0.12g/Alert=0.18g. VibrationMonitoring.jsx
+           and MaintenanceAlerts.jsx used 0.10g/0.20g. Chart labels were
+           inconsistent ("High Vib", "Elevated" vs "Warning", "Critical").
+  Fix    : All components now use 0.10g (Warning) and 0.20g (Critical)
+           with consistent label text: Normal / Warning / Critical.
+
+
+================================================================================
+  END OF DOCUMENTATION
+  SewMetrics v2.1 — 2-Model IoT + ML Sewing Machine Monitoring System
+  (v2.0 = 2-model architecture; v2.1 = idle detection + bug fixes patch)
+================================================================================

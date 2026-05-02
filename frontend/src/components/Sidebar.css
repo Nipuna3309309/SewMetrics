@@ -1,0 +1,12 @@
+.sidebar{position:fixed;top:0;left:0;bottom:0;width:var(--sidebar-w);background:#fff;border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;}
+.sb-brand{display:flex;align-items:center;gap:9px;padding:18px 18px 16px;border-bottom:1px solid var(--border);margin-bottom:8px;}
+.sb-icon{font-size:1.3rem;}
+.sb-name{font-size:.98rem;font-weight:700;}
+.sb-nav{flex:1;padding:0 8px;display:flex;flex-direction:column;gap:2px;}
+.nav-item{display:flex;align-items:center;gap:9px;padding:9px 12px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:.82rem;font-weight:500;transition:all .15s;}
+.nav-item:hover{background:#f3f4f6;color:var(--text);}
+.nav-item.active{background:#eff6ff;color:var(--blue);font-weight:600;}
+.nav-icon{font-size:.95rem;flex-shrink:0;}
+.sb-footer{padding:14px 16px;border-top:1px solid var(--border);}
+.sb-machine-badge{display:flex;align-items:center;font-size:.78rem;font-weight:600;color:#16a34a;margin-bottom:10px;}
+.sb-user{display:flex;align-items:center;gap:8px;}

@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.zip
+*.rar
+*.log
+build/
+dist/
+.claude/
+*.xlsx
+Sewmetrics/
+VAUD assignment 2/
